@@ -23,6 +23,7 @@ jobs:
       github.event.workflow_run.event == 'pull_request'
 
     runs-on: ubuntu-latest
+    environment: netlify-preview
 
     steps:
       - name: Resolve pull request
@@ -57,29 +58,22 @@ jobs:
             );
 
             if (matches.length === 0) {
-              core.notice(
-                `No open PR found for ${headRepo}:${headBranch}. Skipping deployment.`
-              );
+              core.notice(`No open PR found for ${headRepo}:${headBranch}.`);
               core.setOutput("skip", "true");
               return;
             }
 
             if (matches.length !== 1) {
-              throw new Error(
-                `Expected one matching PR, found ${matches.length}.`
-              );
+              throw new Error(`Expected one matching PR, found ${matches.length}.`);
             }
 
             const pr = matches[0];
 
-            // Ensure this artifact belongs to the current PR revision.
             if (
               pr.head.sha !== runSha &&
               pr.merge_commit_sha !== runSha
             ) {
-              core.notice(
-                `PR #${pr.number} has moved on since this build. Skipping stale deployment.`
-              );
+              core.notice(`PR #${pr.number} has moved on. Skipping stale deployment.`);
               core.setOutput("skip", "true");
               return;
             }
@@ -128,10 +122,11 @@ jobs:
         with:
           publish-dir: ${{ runner.temp }}/netlify-preview
           production-deploy: false
-          github-deployment: false
+          enable-github-deployment: false
           enable-pull-request-comment: false
           enable-commit-comment: false
           overwrites-pull-request-comment: false
+          fails-without-credentials: true
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
           NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
@@ -173,23 +168,18 @@ jobs:
               throw new Error(`Unexpected Netlify URL: ${deployUrl}`);
             }
 
-            // Revalidate the PR immediately before publishing the deployment.
             const { data: pr } = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: prNumber
             });
 
-            if (pr.state !== "open") {
-              throw new Error("PR is no longer open.");
-            }
-
-            if (pr.base.ref !== "main") {
-              throw new Error("PR no longer targets main.");
+            if (pr.state !== "open" || pr.base.ref !== "main") {
+              throw new Error("PR is no longer eligible for preview deployment.");
             }
 
             if (pr.head.sha !== expectedHeadSha) {
-              throw new Error("PR head changed while the preview was deploying.");
+              throw new Error("PR head changed while deploying.");
             }
 
             if (
@@ -199,7 +189,6 @@ jobs:
               throw new Error("Build SHA no longer matches the PR.");
             }
 
-            // Create a GitHub deployment for the PR head commit.
             const { data: deployment } =
               await github.rest.repos.createDeployment({
                 owner: context.repo.owner,
@@ -224,7 +213,6 @@ jobs:
               description: "Netlify preview deployed successfully."
             });
 
-            // Update the existing preview comment, if one exists.
             const marker = "<!-- netlify-preview-deployment -->";
 
             const body = [
