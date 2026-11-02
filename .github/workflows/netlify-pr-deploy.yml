@@ -32,37 +32,65 @@ jobs:
           script: |
             const run = context.payload.workflow_run;
 
+            const headRepo = run.head_repository?.full_name;
+            const headBranch = run.head_branch;
+            const runSha = run.head_sha;
+
+            if (!headRepo || !headBranch || !runSha) {
+              throw new Error("Workflow run is missing PR source information.");
+            }
+
             const prs = await github.paginate(
-              github.rest.repos.listPullRequestsAssociatedWithCommit,
+              github.rest.pulls.list,
               {
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                commit_sha: run.head_sha
+                state: "open",
+                base: "main",
+                per_page: 100
               }
             );
 
             const matches = prs.filter(pr =>
-              pr.state === "open" &&
-              pr.base.ref === "main" &&
-              (
-                pr.head.sha === run.head_sha ||
-                pr.merge_commit_sha === run.head_sha
-              )
+              pr.head.repo?.full_name === headRepo &&
+              pr.head.ref === headBranch
             );
+
+            if (matches.length === 0) {
+              core.notice(
+                `No open PR found for ${headRepo}:${headBranch}. Skipping deployment.`
+              );
+              core.setOutput("skip", "true");
+              return;
+            }
 
             if (matches.length !== 1) {
               throw new Error(
-                `Expected exactly one matching open PR, found ${matches.length}.`
+                `Expected one matching PR, found ${matches.length}.`
               );
             }
 
             const pr = matches[0];
 
+            // Ensure this artifact belongs to the current PR revision.
+            if (
+              pr.head.sha !== runSha &&
+              pr.merge_commit_sha !== runSha
+            ) {
+              core.notice(
+                `PR #${pr.number} has moved on since this build. Skipping stale deployment.`
+              );
+              core.setOutput("skip", "true");
+              return;
+            }
+
+            core.setOutput("skip", "false");
             core.setOutput("number", String(pr.number));
             core.setOutput("head-sha", pr.head.sha);
-            core.setOutput("run-sha", run.head_sha);
+            core.setOutput("run-sha", runSha);
 
       - name: Download Netlify artifact
+        if: steps.pr.outputs.skip != 'true'
         uses: actions/download-artifact@v5
         with:
           name: netlify-preview
@@ -71,6 +99,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Validate artifact
+        if: steps.pr.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -94,6 +123,7 @@ jobs:
 
       - name: Deploy to Netlify
         id: netlify
+        if: steps.pr.outputs.skip != 'true'
         uses: nwtgck/actions-netlify@v3
         with:
           publish-dir: ${{ runner.temp }}/netlify-preview
@@ -107,6 +137,7 @@ jobs:
           NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
 
       - name: Create GitHub deployment and PR comment
+        if: steps.pr.outputs.skip != 'true'
         uses: actions/github-script@v8
         env:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
@@ -142,7 +173,7 @@ jobs:
               throw new Error(`Unexpected Netlify URL: ${deployUrl}`);
             }
 
-            // Revalidate the PR before publishing anything to GitHub.
+            // Revalidate the PR immediately before publishing the deployment.
             const { data: pr } = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -168,7 +199,7 @@ jobs:
               throw new Error("Build SHA no longer matches the PR.");
             }
 
-            // Create a GitHub deployment associated with the PR head.
+            // Create a GitHub deployment for the PR head commit.
             const { data: deployment } =
               await github.rest.repos.createDeployment({
                 owner: context.repo.owner,
@@ -193,6 +224,7 @@ jobs:
               description: "Netlify preview deployed successfully."
             });
 
+            // Update the existing preview comment, if one exists.
             const marker = "<!-- netlify-preview-deployment -->";
 
             const body = [
