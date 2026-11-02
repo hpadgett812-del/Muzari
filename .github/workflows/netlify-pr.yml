@@ -3,6 +3,7 @@ name: Netlify Preview Build
 on:
   pull_request:
     branches: ["main"]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
@@ -50,4 +51,5 @@ jobs:
           name: netlify-preview
           path: Build/dist/
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 1
+          include-hidden-files: true
