@@ -1,8 +1,8 @@
-name: Netlify Preview Deploy
+name: Deploy PR build to Netlify
 
 on:
   workflow_run:
-    workflows: ["Netlify Preview Build"]
+    workflows: ["Build PR for Netlify"]
     types: [completed]
 
 permissions:
@@ -10,23 +10,59 @@ permissions:
   contents: read
   deployments: write
   issues: write
-  pull-requests: write
+  pull-requests: read
 
 concurrency:
-  group: netlify-preview-${{ github.event.workflow_run.pull_requests[0].number }}
-  cancel-in-progress: true
+  group: netlify-preview-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
 
 jobs:
   deploy:
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'pull_request' &&
-      github.event.workflow_run.pull_requests[0].number != null
+      github.event.workflow_run.event == 'pull_request'
 
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download preview artifact
+      - name: Resolve pull request
+        id: pr
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+
+            const prs = await github.paginate(
+              github.rest.repos.listPullRequestsAssociatedWithCommit,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: run.head_sha
+              }
+            );
+
+            const matches = prs.filter(pr =>
+              pr.state === "open" &&
+              pr.base.ref === "main" &&
+              (
+                pr.head.sha === run.head_sha ||
+                pr.merge_commit_sha === run.head_sha
+              )
+            );
+
+            if (matches.length !== 1) {
+              throw new Error(
+                `Expected exactly one matching open PR, found ${matches.length}.`
+              );
+            }
+
+            const pr = matches[0];
+
+            core.setOutput("number", String(pr.number));
+            core.setOutput("head-sha", pr.head.sha);
+            core.setOutput("run-sha", run.head_sha);
+
+      - name: Download Netlify artifact
         uses: actions/download-artifact@v5
         with:
           name: netlify-preview
@@ -35,30 +71,37 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Validate artifact
+        shell: bash
         run: |
           set -euo pipefail
 
-          test -d "$RUNNER_TEMP/netlify-preview"
+          DIR="${{ runner.temp }}/netlify-preview"
 
-          if find "$RUNNER_TEMP/netlify-preview" -type l -print -quit | grep -q .; then
-            echo "Symlinks are not allowed in the preview artifact."
+          if [ ! -d "$DIR" ]; then
+            echo "Artifact directory does not exist."
             exit 1
           fi
 
-          if ! find "$RUNNER_TEMP/netlify-preview" -type f -print -quit | grep -q .; then
-            echo "Preview artifact is empty."
+          if find "$DIR" -type l -print -quit | grep -q .; then
+            echo "Artifact contains symlinks."
             exit 1
           fi
 
-      - name: Deploy preview to Netlify
+          if ! find "$DIR" -type f -print -quit | grep -q .; then
+            echo "Artifact is empty."
+            exit 1
+          fi
+
+      - name: Deploy to Netlify
         id: netlify
         uses: nwtgck/actions-netlify@v3
         with:
           publish-dir: ${{ runner.temp }}/netlify-preview
           production-deploy: false
-          deploy-message: "GitHub Actions PR preview"
+          github-deployment: false
+          enable-pull-request-comment: false
           enable-commit-comment: false
-          enable-github-deployment: false
+          overwrites-pull-request-comment: false
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
           NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
@@ -66,57 +109,76 @@ jobs:
       - name: Create GitHub deployment and PR comment
         uses: actions/github-script@v8
         env:
-          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
-          PR_HEAD_SHA: ${{ github.event.workflow_run.pull_requests[0].head.sha }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_HEAD_SHA: ${{ steps.pr.outputs.head-sha }}
+          RUN_HEAD_SHA: ${{ steps.pr.outputs.run-sha }}
           DEPLOY_URL: ${{ steps.netlify.outputs.deploy-url }}
           RUN_ID: ${{ github.event.workflow_run.id }}
         with:
           script: |
             const prNumber = Number(process.env.PR_NUMBER);
-            const headSha = process.env.PR_HEAD_SHA;
+            const expectedHeadSha = process.env.PR_HEAD_SHA;
+            const runHeadSha = process.env.RUN_HEAD_SHA;
             const deployUrl = process.env.DEPLOY_URL;
+            const runId = process.env.RUN_ID;
 
-            if (!Number.isSafeInteger(prNumber) || prNumber < 1) {
+            if (!Number.isInteger(prNumber) || prNumber <= 0) {
               throw new Error("Invalid PR number.");
             }
 
-            if (!/^[a-f0-9]{40}$/i.test(headSha || "")) {
-              throw new Error("Invalid PR commit SHA.");
+            if (!deployUrl) {
+              throw new Error("Netlify did not return a deploy URL.");
             }
 
-            const url = new URL(deployUrl);
+            const parsedUrl = new URL(deployUrl);
+
             if (
-              url.protocol !== "https:" ||
-              !url.hostname.endsWith(".netlify.app")
+              parsedUrl.protocol !== "https:" ||
+              !(
+                parsedUrl.hostname === "netlify.app" ||
+                parsedUrl.hostname.endsWith(".netlify.app")
+              )
             ) {
-              throw new Error("Unexpected Netlify deployment URL.");
+              throw new Error(`Unexpected Netlify URL: ${deployUrl}`);
             }
 
-            // Re-check the PR against GitHub's API
+            // Revalidate the PR before publishing anything to GitHub.
             const { data: pr } = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: prNumber
             });
 
-            if (
-              pr.state !== "open" ||
-              pr.base.ref !== "main" ||
-              pr.head.sha !== headSha
-            ) {
-              throw new Error("PR is closed, targets another branch, or has changed.");
+            if (pr.state !== "open") {
+              throw new Error("PR is no longer open.");
             }
 
+            if (pr.base.ref !== "main") {
+              throw new Error("PR no longer targets main.");
+            }
+
+            if (pr.head.sha !== expectedHeadSha) {
+              throw new Error("PR head changed while the preview was deploying.");
+            }
+
+            if (
+              pr.head.sha !== runHeadSha &&
+              pr.merge_commit_sha !== runHeadSha
+            ) {
+              throw new Error("Build SHA no longer matches the PR.");
+            }
+
+            // Create a GitHub deployment associated with the PR head.
             const { data: deployment } =
               await github.rest.repos.createDeployment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                ref: headSha,
+                ref: pr.head.sha,
                 task: "deploy",
                 auto_merge: false,
                 required_contexts: [],
                 environment: "netlify-preview",
-                description: `Preview for PR #${prNumber}`,
+                description: `Netlify preview for PR #${prNumber}`,
                 transient_environment: true,
                 production_environment: false
               });
@@ -126,19 +188,22 @@ jobs:
               repo: context.repo.repo,
               deployment_id: deployment.id,
               state: "success",
-              environment_url: url.href,
-              log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${process.env.RUN_ID}`,
-              description: "Netlify preview deployed"
+              environment_url: deployUrl,
+              log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId}`,
+              description: "Netlify preview deployed successfully."
             });
 
-            const marker = "<!-- netlify-preview -->";
+            const marker = "<!-- netlify-preview-deployment -->";
+
             const body = [
               marker,
-              "### Netlify preview",
+              "### Netlify Preview",
               "",
-              `[Open preview](${url.href})`,
+              `**Preview:** [Open deployment](${deployUrl})`,
               "",
-              `Deployed commit: \`${headSha.slice(0, 7)}\``
+              `**Commit:** \`${pr.head.sha.slice(0, 7)}\``,
+              "",
+              `_Deployed by [GitHub Actions](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId})._`
             ].join("\n");
 
             const comments = await github.paginate(
@@ -150,10 +215,9 @@ jobs:
               }
             );
 
-            const existing = comments.find(
-              comment =>
-                comment.user?.type === "Bot" &&
-                comment.body?.includes(marker)
+            const existing = comments.find(comment =>
+              comment.body?.includes(marker) &&
+              comment.user?.type === "Bot"
             );
 
             if (existing) {
