@@ -1,27 +1,20 @@
-name: Netlify Preview Deploy
+name: Netlify Preview Build
 
 on:
   pull_request:
     branches: ["main"]
-  workflow_dispatch:
 
 permissions:
   contents: read
-  deployments: write
-  statuses: write
-  pull-requests: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: netlify-preview-build-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
-    environment:
-      name: netlify-preview
-      url: ${{ steps.netlify.outputs.deploy-url }}
-      
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,17 +44,10 @@ jobs:
         env:
           BASE_PATH: /
 
-      - name: Deploy preview to Netlify
-        id: netlify
-        uses: nwtgck/actions-netlify@v3
+      - name: Upload preview artifact
+        uses: actions/upload-artifact@v4
         with:
-          publish-dir: './Build/dist'
-          production-deploy: false
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          deploy-message: "Deploy PR preview from GitHub Actions"
-          enable-commit-comment: true
-          enable-github-deployment: true
-          github-deployment-environment: "Preview - Netlify"
-        env:
-          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
-          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+          name: netlify-preview
+          path: Build/dist/
+          if-no-files-found: error
+          retention-days: 3
